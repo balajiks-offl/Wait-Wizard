@@ -12,14 +12,17 @@ firebase.initializeApp(firebaseConfig);
 const db = firebase.database();
 const auth = firebase.auth();
 let USER_ID = null;
+const priorityQueueManager = new PriorityQueue();
+const cacheManager = new LRUCache(50);
+const rateLimiter = new TokenBucket(10, 2);
+let waitTimeHistory = [];
 
 firebase.auth().onAuthStateChanged((user) => {
   if (user) {
     USER_ID = user.uid;
-    updateWelcomeMsg();   // Update the welcome message with current user's name
-    renderSection('home'); // Load the home page content for logged in user
+    updateWelcomeMsg();
+    renderSection('home');
   } else {
-    // No user signed in, redirect to login
     window.location.href = 'index.html';
   }
 });
@@ -331,16 +334,18 @@ function updateUpcomingAppointments() {
         }
       });
 
-      //  Sort based on ticketIdNum
       appointments.sort((a, b) => {
         return (parseInt(a.ticketIdNum || 9999)) - (parseInt(b.ticketIdNum || 9999));
       });
+
+      const stats = calculateWaitTimeStats(snapshot.val() || {});
 
       const html = appointments.map((t) => `
         <div class="upcoming-item">
           <b>#${t.ticketId} | ${t.apptDate} ${t.apptTime}</b><br />
           Name: ${t.fullName} | Status: ${t.status} | Type: ${t.ticketType}
           ${t.symptoms ? `<br><small>Notes: ${t.symptoms}</small>` : ""}
+          ${stats.avgWaitTime > 0 ? `<br><small style="color:#ff9800;">Est. Wait: ${stats.avgWaitTime} min</small>` : ""}
         </div>
       `).join("");
 
@@ -457,42 +462,54 @@ function showBook() {
     return;
   }
 
+  if (!rateLimiter.consume()) {
+    showPopup("⚠️", "Too many booking attempts. Please wait.");
+    return;
+  }
+
   try {
-    // Generate a random 4-digit number
-    const randomId = Math.floor(1000 + Math.random() * 9000);
-    const ticketIdStr = String(randomId);
+    const operation = async () => {
+      const randomId = Math.floor(1000 + Math.random() * 9000);
+      const ticketIdStr = String(randomId);
 
-    // Make sure this ticketId does not already exist
-    const existing = await db.ref("tickets").orderByChild("ticketId").equalTo(ticketIdStr).once("value");
+      const existing = await db.ref("tickets").orderByChild("ticketId").equalTo(ticketIdStr).once("value");
 
-    if (existing.exists()) {
-      // Recursively retry — or just show error
-      showPopup("⚠️", "Ticket ID already in use. Please try again.");
-      return;
-    }
+      if (existing.exists()) {
+        throw new Error("Ticket ID already in use.");
+      }
 
-    const ticketKey = db.ref("tickets").push().key;
+      const ticketKey = db.ref("tickets").push().key;
+      const ticketType = form.ticketType.value;
+      const priority = ticketType === "emergency" ? 10 : 5;
 
-    const ticketData = {
-      ticketId: ticketIdStr, // Random
-      ticketIdNum: parseInt(ticketIdStr),
-      userId: USER_ID,
-      fullName: form.fullname.value.trim(),
-      mobile: form.mobile.value.trim(),
-      gender: form.gender.value,
-      age: parseInt(form.age.value, 10),
-      ticketType: form.ticketType.value,
-      apptDate: form.apptDate.value,
-      apptTime: form.apptTime.value,
-      symptoms: form.symptoms.value.trim(),
-      status: "Booked",
-      createdAt: new Date().toISOString()
+      const ticketData = {
+        ticketId: ticketIdStr,
+        ticketIdNum: parseInt(ticketIdStr),
+        userId: USER_ID,
+        fullName: form.fullname.value.trim(),
+        mobile: form.mobile.value.trim(),
+        gender: form.gender.value,
+        age: parseInt(form.age.value, 10),
+        ticketType: ticketType,
+        apptDate: form.apptDate.value,
+        apptTime: form.apptTime.value,
+        symptoms: form.symptoms.value.trim(),
+        status: "Booked",
+        priority: priority,
+        createdAt: new Date().toISOString()
+      };
+
+      priorityQueueManager.insert(ticketData);
+      cacheManager.put(`ticket_${ticketIdStr}`, ticketData);
+
+      await db.ref("tickets/" + ticketKey).set(ticketData);
+      return ticketIdStr;
     };
 
-    await db.ref("tickets/" + ticketKey).set(ticketData);
+    const ticketId = await exponentialBackoff(operation, 3);
 
     form.reset();
-    showPopup("✅", `Ticket booked! ID: #${ticketIdStr}`);
+    showPopup("✅", `Ticket booked! ID: #${ticketId}`);
     renderSection("home");
 
   } catch (err) {

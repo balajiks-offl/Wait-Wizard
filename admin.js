@@ -16,6 +16,9 @@ const auth = firebase.auth();
 let doctorsMap = {};
 let tickets = {};
 let doctorTicketCounts = {};
+const adminCacheManager = new LRUCache(100);
+const notificationBatcher = new NotificationBatcher(5, 3000);
+const adminRateLimiter = new TokenBucket(20, 5);
 
 auth.onAuthStateChanged(async user => {
   if (!user) return window.location.href = "login.html"; // not logged in
@@ -176,21 +179,51 @@ function applyFilter() {
 }
 
 function assignDoctorToTicket(ticketId, doctorUid) {
-  if (!doctorUid) return;
+  if (!doctorUid || !adminRateLimiter.consume()) return;
+
   db.ref("tickets")
     .orderByChild("ticketId")
     .equalTo(ticketId)
-    .once("value", snapshot => {
+    .once("value", async snapshot => {
       const updates = {};
       snapshot.forEach(child => {
         const key = child.key;
-        updates[`${key}/doctorAssigned`] = doctorUid;
+        const ticket = child.val();
+
+        let assignedDoctor = doctorUid;
+
+        if (!doctorUid || doctorUid === "auto") {
+          const doctorList = Object.entries(doctorsMap).map(([uid, doc]) => ({
+            id: uid,
+            ...doc
+          }));
+
+          const recommendedDoctor = leastLoadAssignment(
+            ticket,
+            doctorList,
+            doctorTicketCounts
+          );
+
+          assignedDoctor = recommendedDoctor?.id || doctorUid;
+        }
+
+        updates[`${key}/doctorAssigned`] = assignedDoctor;
         updates[`${key}/apptDate`] = new Date().toISOString().split("T")[0];
         if (!child.val().status || child.val().status === "pending") {
           updates[`${key}/status`] = "booked";
         }
       });
-      db.ref("tickets").update(updates).then(() => applyFilter());
+
+      try {
+        await exponentialBackoff(
+          () => db.ref("tickets").update(updates),
+          3
+        );
+        adminCacheManager.put(`assignment_${ticketId}`, { doctorUid, timestamp: Date.now() });
+        applyFilter();
+      } catch (error) {
+        console.error("Assignment failed:", error);
+      }
     });
 }
 
@@ -211,14 +244,24 @@ function updateTicketStatus(ticketId, newStatus) {
 function renderDoctorsTable() {
   const tbody = document.getElementById("doctorsTable");
   tbody.innerHTML = "";
-  Object.entries(doctorsMap).forEach(([uid, doc]) => {
-    const count = doctorTicketCounts[uid] || { open: 0, closed: 0 };
+
+  const doctorList = Object.entries(doctorsMap).map(([uid, doc]) => ({
+    id: uid,
+    ...doc
+  }));
+
+  const optimizedSchedule = optimizeDoctorSchedule(tickets, doctorList);
+
+  optimizedSchedule.forEach(({ doctor, load }) => {
+    const count = doctorTicketCounts[doctor.id] || { open: 0, closed: 0 };
+    const workloadColor = load > 5 ? "#ff6b6b" : load > 2 ? "#ffa94d" : "#51cf66";
     const row = document.createElement("tr");
     row.innerHTML = `
-      <td>${uid.slice(0, 6)}...</td>
-      <td>${doc.name}</td>
-      <td>${doc.email}</td>
+      <td>${doctor.id.slice(0, 6)}...</td>
+      <td>${doctor.name}</td>
+      <td>${doctor.email}</td>
       <td>${count.open} / ${count.closed}</td>
+      <td><span style="background-color:${workloadColor};padding:4px 8px;border-radius:4px;color:white;font-size:0.9em;">Load: ${load}</span></td>
     `;
     tbody.appendChild(row);
   });
